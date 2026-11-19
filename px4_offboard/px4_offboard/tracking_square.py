@@ -4,8 +4,14 @@ tracking_square.py - fly the 5 x 5 m square with your own controller.
 
 Two choices, set as ROS parameters:
 
-  controller:=pd   hand-tuned PD gains          (same as pd_square.py)
-  controller:=lqr  gains from LQR (optimal for the chosen weights Q, R)
+  controller:=pd       hand-tuned PD gains          (same as pd_square.py)
+  controller:=lqr      LQR on a point-mass model (position, velocity)
+  controller:=lqr_lag  LQR on a model that also includes how slowly the drone
+                       follows an acceleration command (time constant tau),
+                       and feeds back the measured acceleration as well
+
+LQR weights can be changed without editing code:
+  -p q_p:=9.0 -p q_v:=4.0 -p q_a:=0.1 -p r:=1.0 -p tau:=0.2
 
   reference:=linear  target moves at constant speed and stops instantly at corners
   reference:=smooth  minimum-jerk target: speeds up and slows down smoothly,
@@ -26,7 +32,11 @@ LQR for one axis of a point mass (double integrator):
         K_p = sqrt(q_p / r)
         K_d = sqrt(q_v / r + 2 * K_p)
 
-Log: ~/square_<controller>_<reference>.csv
+Lag model used by lqr_lag (per horizontal axis), measured with tools/fit_lag.py:
+    a_actual' = (a_cmd - a_actual) / tau,   tau ~ 0.2 s in PX4 SITL
+    state x = [e_p, e_v, e_a],  gains from the discrete Riccati equation (numpy)
+
+Log: ~/square_<controller>_<reference><tag>.csv
 """
 import csv
 import math
@@ -71,6 +81,30 @@ def lqr_gains(q_p, q_v, r):
     k_p = math.sqrt(q_p / r)
     k_d = math.sqrt(q_v / r + 2.0 * k_p)
     return k_p, k_d
+
+
+def dlqr(A, B, Q, R, iters=10000):
+    """Discrete-time LQR by iterating the Riccati equation (numpy only)."""
+    import numpy as np
+    P = Q.copy()
+    for _ in range(iters):
+        K = np.linalg.solve(R + B.T @ P @ B, B.T @ P @ A)
+        P_next = Q + A.T @ P @ (A - B @ K)
+        if np.max(np.abs(P_next - P)) < 1e-10:
+            break
+        P = P_next
+    return K
+
+
+def lqr_lag_gains(q_p, q_v, q_a, r, tau, dt):
+    """Gains [K_p, K_v, K_a] for the model p' = v, v' = a, a' = (u - a) / tau."""
+    import numpy as np
+    A_c = np.array([[0.0, 1.0, 0.0], [0.0, 0.0, 1.0], [0.0, 0.0, -1.0 / tau]])
+    B_c = np.array([[0.0], [0.0], [1.0 / tau]])
+    A = np.eye(3) + A_c * dt          # simple Euler discretisation, dt = control period
+    B = B_c * dt
+    K = dlqr(A, B, np.diag([q_p, q_v, q_a]), np.array([[r]]))
+    return tuple(float(k) for k in K[0])
 
 
 A_MAX_XY = 3.0
@@ -141,13 +175,24 @@ class TrackingSquare(Node):
         super().__init__('tracking_square')
         self.controller = self.declare_parameter('controller', 'lqr').value
         self.reference = self.declare_parameter('reference', 'smooth').value
-        if self.controller not in ('pd', 'lqr') or self.reference not in ('linear', 'smooth'):
-            raise ValueError('controller must be pd|lqr, reference must be linear|smooth')
+        tag = self.declare_parameter('tag', '').value
+        q_p = float(self.declare_parameter('q_p', LQR_WEIGHTS['xy'][0]).value)
+        q_v = float(self.declare_parameter('q_v', LQR_WEIGHTS['xy'][1]).value)
+        q_a = float(self.declare_parameter('q_a', 0.1).value)
+        r = float(self.declare_parameter('r', LQR_WEIGHTS['xy'][2]).value)
+        tau = float(self.declare_parameter('tau', 0.2).value)
+        if self.controller not in ('pd', 'lqr', 'lqr_lag') or \
+                self.reference not in ('linear', 'smooth'):
+            raise ValueError('controller must be pd|lqr|lqr_lag, reference must be linear|smooth')
 
+        # xy gains are (K_p, K_v) or (K_p, K_v, K_a); z always uses a 2-state LQR/PD
         if self.controller == 'pd':
-            self.gains = PD_GAINS
+            self.gains = dict(PD_GAINS)
+        elif self.controller == 'lqr':
+            self.gains = {'xy': lqr_gains(q_p, q_v, r), 'z': lqr_gains(*LQR_WEIGHTS['z'])}
         else:
-            self.gains = {axis: lqr_gains(*w) for axis, w in LQR_WEIGHTS.items()}
+            self.gains = {'xy': lqr_lag_gains(q_p, q_v, q_a, r, tau, 1.0 / RATE_HZ),
+                          'z': lqr_gains(*LQR_WEIGHTS['z'])}
 
         pub_qos = QoSProfile(reliability=ReliabilityPolicy.BEST_EFFORT,
                              durability=DurabilityPolicy.TRANSIENT_LOCAL,
@@ -166,23 +211,26 @@ class TrackingSquare(Node):
         self.home = None
         self.ref = None
         self.square_t0 = None
+        self.prev = None
+        self.jumps = 0
         self.state = 'INIT'
         self.tick = 0
         self.done = False
         self.t0 = self.now()
 
-        log_path = os.path.expanduser(f'~/square_{self.controller}_{self.reference}.csv')
+        log_path = os.path.expanduser(f'~/square_{self.controller}_{self.reference}{tag}.csv')
         self.log_file = open(log_path, 'w', newline='')
         self.log = csv.writer(self.log_file)
         self.log.writerow(['t', 'state', 'x', 'y', 'z', 'vx', 'vy', 'vz',
-                           'ref_x', 'ref_y', 'ref_z', 'ax', 'ay', 'az'])
+                           'ref_x', 'ref_y', 'ref_z', 'ax', 'ay', 'az',
+                           'xy_reset', 'z_reset'])
 
         self.create_timer(1.0 / RATE_HZ, self.step)
-        (kp_xy, kd_xy), (kp_z, kd_z) = self.gains['xy'], self.gains['z']
+        gains_xy = ' '.join(f'{k:.2f}' for k in self.gains['xy'])
+        kp_z, kd_z = self.gains['z']
         self.get_logger().info(
             f'controller={self.controller} reference={self.reference} | '
-            f'Kp_xy={kp_xy:.2f} Kd_xy={kd_xy:.2f} Kp_z={kp_z:.2f} Kd_z={kd_z:.2f} | '
-            f'log: {log_path}')
+            f'K_xy=[{gains_xy}] Kp_z={kp_z:.2f} Kd_z={kd_z:.2f} | log: {log_path}')
 
     # ---------------- helpers ----------------
     def now(self):
@@ -241,10 +289,14 @@ class TrackingSquare(Node):
     def control(self, p_ref, v_ref, a_ref):
         p = (self.pos.x, self.pos.y, self.pos.z)
         v = (self.pos.vx, self.pos.vy, self.pos.vz)
+        a_meas = (self.pos.ax, self.pos.ay, self.pos.az)
         a = []
         for i in range(3):
-            kp, kd = self.gains['z' if i == 2 else 'xy']
-            a.append(a_ref[i] + kp * (p_ref[i] - p[i]) + kd * (v_ref[i] - v[i]))
+            k = self.gains['z' if i == 2 else 'xy']
+            u = a_ref[i] + k[0] * (p_ref[i] - p[i]) + k[1] * (v_ref[i] - v[i])
+            if len(k) == 3:                       # lqr_lag: also use the acceleration error
+                u += k[2] * (a_ref[i] - a_meas[i])
+            a.append(u)
         a_xy = math.hypot(a[0], a[1])
         if a_xy > A_MAX_XY:
             a[0], a[1] = a[0] * A_MAX_XY / a_xy, a[1] * A_MAX_XY / a_xy
@@ -286,6 +338,7 @@ class TrackingSquare(Node):
                 if dist < 0.2 and math.hypot(self.pos.vx, self.pos.vy) < 0.2:
                     self.ref = SquareReference(self.home, self.reference == 'smooth')
                     self.square_t0 = t
+                    self.last_reset = self.pos.xy_reset_counter
                     self.state = 'SQUARE'
                     self.get_logger().info(
                         f'At start. Switching to YOUR {self.controller.upper()} controller.')
@@ -296,12 +349,27 @@ class TrackingSquare(Node):
                 self.done = True
                 return
             ts = t - self.square_t0
+            if self.prev is not None:            # position must match velocity * time
+                pt, px, py, pvx, pvy = self.prev
+                dt = t - pt
+                jump = math.hypot(self.pos.x - (px + pvx * dt), self.pos.y - (py + pvy * dt))
+                if jump > 0.1:
+                    self.jumps += 1
+                    self.get_logger().warn(
+                        f'Position jumped {jump:.2f} m at {ts:.1f} s (estimator glitch) '
+                        '-> this run is not valid, please fly again')
+            self.prev = (t, self.pos.x, self.pos.y, self.pos.vx, self.pos.vy)
+            if self.pos.xy_reset_counter != self.last_reset:
+                self.get_logger().warn(
+                    'PX4 estimator reset its position during the square -> this run is not valid')
+                self.last_reset = self.pos.xy_reset_counter
             ref_p, ref_v, ref_a = self.ref.at(ts)
             acc = self.control(ref_p, ref_v, ref_a)
             self.publish_mode(acceleration=True)
             self.publish_setpoint(acceleration=acc)
             if ts > self.ref.end_time:
-                self.get_logger().info('Square complete. Landing.')
+                verdict = 'VALID run' if self.jumps == 0 else f'NOT valid ({self.jumps} glitches)'
+                self.get_logger().info(f'Square complete ({verdict}). Landing.')
                 self.send_command(VehicleCommand.VEHICLE_CMD_NAV_LAND)
                 self.state = 'LAND'
 
@@ -314,7 +382,8 @@ class TrackingSquare(Node):
                            f'{self.pos.x:.3f}', f'{self.pos.y:.3f}', f'{self.pos.z:.3f}',
                            f'{self.pos.vx:.3f}', f'{self.pos.vy:.3f}', f'{self.pos.vz:.3f}',
                            f'{ref_p[0]:.3f}', f'{ref_p[1]:.3f}', f'{ref_p[2]:.3f}',
-                           f'{acc[0]:.3f}', f'{acc[1]:.3f}', f'{acc[2]:.3f}'])
+                           f'{acc[0]:.3f}', f'{acc[1]:.3f}', f'{acc[2]:.3f}',
+                           self.pos.xy_reset_counter, self.pos.z_reset_counter])
 
     def close(self):
         self.log_file.close()

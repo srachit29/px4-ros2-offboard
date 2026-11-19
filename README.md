@@ -7,16 +7,39 @@ This is the first part of a project that compares the PX4 default controller,
 a custom **MPC** controller and a learned **RL** controller on the same
 trajectory-tracking tasks.
 
-![Square mission](results/square_mission_plot.png)
+![Comparison](results/compare_all.png)
 
 ## Results so far
 
-| Controller | Task | Path error (RMS) | Max path error | Height along square |
-|---|---|---|---|---|
-| PX4 position control (baseline) | 5 x 5 m square at 5 m | 0.08 m | 0.25 m | 4.90 to 5.16 m |
+5 x 5 m square at 5 m height, 4 s per side, PX4 SITL with Gazebo x500.
+Own controllers send acceleration setpoints; PX4 only handles attitude and motors.
 
-The small height dips at each corner happen when the drone brakes and turns.
-Reducing them is the target for the custom controllers.
+| Controller | Reference | Path error RMS | Path error max | Height error RMS | Height error max |
+|---|---|---|---|---|---|
+| PX4 position control | corner to corner | 8.4 cm | 24.7 cm | 5.1 cm | 16.0 cm |
+| Own PD | constant speed | 19.8 cm* | 83.4 cm* | 3.7 cm | 19.6 cm |
+| Own PD | minimum-jerk + feed-forward | **3.8 cm** | **9.4 cm** | 2.6 cm | 17.3 cm |
+| Own LQR (q_p=9, q_v=4, r=1) | minimum-jerk + feed-forward | 3.9 cm | 9.5 cm | **2.0 cm** | **9.5 cm** |
+
+\* this run also contains one estimator position jump.
+
+**Findings**
+
+- The biggest improvement comes from the **reference**, not the gains: a minimum-jerk
+  trajectory with acceleration feed-forward cut the path error of the same PD controller
+  from 20 cm to 4 cm and removed the corner overshoot.
+- LQR with too little velocity weight (q_v = 1) overshot corners (7 cm RMS). LQR is only
+  optimal for its model, and the point-mass model ignores the drone's response lag.
+  Raising q_v to 4 fixed it.
+- From the logs, the drone follows acceleration commands with about **0.08 s delay and a
+  0.2 s time constant** (`tools/fit_lag.py`). This lag is the next limit, and the reason
+  for the next step: **MPC**, which plans ahead using a model that includes it.
+- The PX4 baseline flew a different (corner-to-corner) pattern, so it is a reference
+  point rather than a strict comparison.
+
+**Data quality:** in WSL2 SITL, PX4's position estimate sometimes jumps (up to 11 m in one
+20 ms step). `tracking_square.py` checks that position matches velocity x time and marks
+such runs as not valid. Apart from the marked PD run (kept to show the overshoot), only valid runs are in the table.
 
 ## How it works
 
@@ -61,8 +84,11 @@ MicroXRCEAgent udp4 -p 8888
 cd ~/PX4-Autopilot && make px4_sitl gz_x500
 # terminal 3
 ros2 run px4_offboard square_mission
-# plot the flight
-python3 tools/plot_square.py ~/square_log.csv square_plot.png
+# own controllers (pd | lqr | lqr_lag, reference linear | smooth)
+ros2 run px4_offboard tracking_square --ros-args -p controller:=lqr -p q_v:=4.0
+# compare flights
+python3 tools/compare_all.py out.png "PD=~/square_pd_smooth.csv" "LQR=~/square_lqr_smooth.csv"
+python3 tools/fit_lag.py ~/square_lqr_smooth.csv
 ```
 
 ### Simulation-only PX4 parameters
@@ -82,7 +108,8 @@ Never use these settings on a real vehicle.
 ## Roadmap
 
 - [x] PX4 SITL + ROS 2 bridge, offboard square mission, logging and plots
-- [ ] Custom position controller (PD, then LQR) sending acceleration setpoints
+- [x] Custom position controller (PD, then LQR) sending acceleration setpoints
+- [x] Minimum-jerk reference with feed-forward, lag identification from flight logs
 - [ ] Model Predictive Control (MPC)
 - [ ] Reinforcement learning controller
 - [ ] Comparison on square, figure-eight and wind-disturbance tests
