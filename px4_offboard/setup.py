@@ -20,6 +20,7 @@ setup(
         'console_scripts': [
             'square_mission = px4_offboard.square_mission:main',
             'pd_square = px4_offboard.pd_square:main',
+            'tracking_square = px4_offboard.tracking_square:main',
         ],
     },
 )
