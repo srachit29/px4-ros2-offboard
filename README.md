@@ -18,8 +18,9 @@ Own controllers send acceleration setpoints; PX4 only handles attitude and motor
 |---|---|---|---|---|---|
 | PX4 position control | corner to corner | 8.4 cm | 24.7 cm | 5.1 cm | 16.0 cm |
 | Own PD | constant speed | 19.8 cm* | 83.4 cm* | 3.7 cm | 19.6 cm |
-| Own PD | minimum-jerk + feed-forward | **3.8 cm** | **9.4 cm** | 2.6 cm | 17.3 cm |
+| Own PD | minimum-jerk + feed-forward | 3.8 cm | 9.4 cm | 2.6 cm | 17.3 cm |
 | Own LQR (q_p=9, q_v=4, r=1) | minimum-jerk + feed-forward | 3.9 cm | 9.5 cm | **2.0 cm** | **9.5 cm** |
+| Own MPC (1.5 s horizon, lag + delay model) | minimum-jerk, full preview | **3.7 cm** | **8.2 cm** | 2.6 cm | 19.8 cm |
 
 \* this run also contains one estimator position jump.
 
@@ -32,8 +33,13 @@ Own controllers send acceleration setpoints; PX4 only handles attitude and motor
   optimal for its model, and the point-mass model ignores the drone's response lag.
   Raising q_v to 4 fixed it.
 - From the logs, the drone follows acceleration commands with about **0.08 s delay and a
-  0.2 s time constant** (`tools/fit_lag.py`). This lag is the next limit, and the reason
-  for the next step: **MPC**, which plans ahead using a model that includes it.
+  0.2 s time constant** (`tools/fit_lag.py`). The MPC (`mpc.py`) uses this model, predicts
+  1.5 s ahead and sees each corner coming. It gave the smallest path error and held the
+  corners best (9 cm RMS error while hovering at corners, vs. 15 cm for LQR and 17 cm for PD).
+  It solves in about 1 ms per step (projected-gradient QP, numpy only).
+- While moving, MPC trails the target by about 7 cm on average (LQR: 2.5 cm). Telling the
+  MPC the drone is slower (tau 0.3 s instead of 0.2 s) did not reduce this (7.4 cm), so the
+  cause is not the lag model; it is still open.
 - The PX4 baseline flew a different (corner-to-corner) pattern, so it is a reference
   point rather than a strict comparison.
 
@@ -110,7 +116,7 @@ Never use these settings on a real vehicle.
 - [x] PX4 SITL + ROS 2 bridge, offboard square mission, logging and plots
 - [x] Custom position controller (PD, then LQR) sending acceleration setpoints
 - [x] Minimum-jerk reference with feed-forward, lag identification from flight logs
-- [ ] Model Predictive Control (MPC)
+- [x] Model Predictive Control (MPC)
 - [ ] Reinforcement learning controller
 - [ ] Comparison on square, figure-eight and wind-disturbance tests
 
