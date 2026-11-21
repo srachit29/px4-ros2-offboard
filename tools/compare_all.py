@@ -16,7 +16,9 @@ def load(path):
     sq = [r for r in rows if r['state'] == 'SQUARE']
     t0 = float(sq[0]['t'])
     hx, hy = float(rows[0]['x']), float(rows[0]['y'])
-    return dict(t=[float(r['t']) - t0 for r in sq],
+    trk = [math.hypot(float(r['x']) - float(r['ref_x']), float(r['y']) - float(r['ref_y']))
+           for r in sq] if 'ref_x' in sq[0] else None
+    return dict(trk=trk, t=[float(r['t']) - t0 for r in sq],
                 n=[float(r['x']) - hx for r in sq], e=[float(r['y']) - hy for r in sq],
                 h=[-float(r['z']) for r in sq])
 
@@ -31,7 +33,8 @@ def metrics(d):
     path = [min(seg_dist(n, e, SQ[k], SQ[k + 1]) for k in range(4)) for n, e in zip(d['n'], d['e'])]
     herr = [abs(h - 5.0) for h in d['h']]
     rms = lambda v: math.sqrt(sum(x * x for x in v) / len(v))
-    return path_rms_max(path) + (rms(herr), max(herr))
+    trk = rms(d['trk']) if d['trk'] else float('nan')
+    return path_rms_max(path) + (rms(herr), max(herr), trk)
 
 
 def path_rms_max(path):
@@ -41,11 +44,13 @@ def path_rms_max(path):
 def main():
     out = sys.argv[1]
     runs = [(a.split('=', 1)[0], load(a.split('=', 1)[1])) for a in sys.argv[2:]]
-    print('| Controller | Path error RMS | Path error max | Height error RMS | Height error max |')
-    print('|---|---|---|---|---|')
+    print('| Controller | Path error RMS | Path error max | Error to moving target RMS '
+          '| Height error RMS | Height error max |')
+    print('|---|---|---|---|---|---|')
     for name, d in runs:
-        pr, pm, hr, hm = metrics(d)
-        print(f'| {name} | {pr*100:.1f} cm | {pm*100:.1f} cm | {hr*100:.1f} cm | {hm*100:.1f} cm |')
+        pr, pm, hr, hm, tr = metrics(d)
+        print(f'| {name} | {pr*100:.1f} cm | {pm*100:.1f} cm | {tr*100:.1f} cm '
+              f'| {hr*100:.1f} cm | {hm*100:.1f} cm |')
 
     fig = plt.figure(figsize=(14, 4.8))
     a1, a2, a3 = fig.add_subplot(1, 3, 1), fig.add_subplot(1, 3, 2), fig.add_subplot(1, 3, 3)

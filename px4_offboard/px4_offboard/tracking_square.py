@@ -6,6 +6,9 @@ Two choices, set as ROS parameters:
 
   controller:=pd       hand-tuned PD gains          (same as pd_square.py)
   controller:=lqr      LQR on a point-mass model (position, velocity)
+  controller:=mpc      Model Predictive Control (mpc.py): plans 1.5 s ahead with a
+                       model that includes the drone's lag and delay, and uses the
+                       FUTURE reference (it sees corners coming)
   controller:=lqr_lag  LQR on a model that also includes how slowly the drone
                        follows an acceleration command (time constant tau),
                        and feeds back the measured acceleration as well
@@ -45,6 +48,10 @@ import os
 import rclpy
 from rclpy.node import Node
 from rclpy.qos import DurabilityPolicy, HistoryPolicy, QoSProfile, ReliabilityPolicy
+
+from collections import deque
+
+from px4_offboard.mpc import AxisMPC, predict_through_delay
 
 from px4_msgs.msg import (
     OffboardControlMode,
@@ -181,18 +188,33 @@ class TrackingSquare(Node):
         q_a = float(self.declare_parameter('q_a', 0.1).value)
         r = float(self.declare_parameter('r', LQR_WEIGHTS['xy'][2]).value)
         tau = float(self.declare_parameter('tau', 0.2).value)
-        if self.controller not in ('pd', 'lqr', 'lqr_lag') or \
+        delay = float(self.declare_parameter('delay', 0.08).value)
+        mpc_q_p = float(self.declare_parameter('mpc_q_p', 50.0).value)
+        mpc_q_v = float(self.declare_parameter('mpc_q_v', 5.0).value)
+        mpc_r_du = float(self.declare_parameter('mpc_r_du', 2.0).value)
+        if self.controller not in ('pd', 'lqr', 'lqr_lag', 'mpc') or \
                 self.reference not in ('linear', 'smooth'):
-            raise ValueError('controller must be pd|lqr|lqr_lag, reference must be linear|smooth')
+            raise ValueError('controller must be pd|lqr|lqr_lag|mpc, '
+                             'reference must be linear|smooth')
 
         # xy gains are (K_p, K_v) or (K_p, K_v, K_a); z always uses a 2-state LQR/PD
         if self.controller == 'pd':
             self.gains = dict(PD_GAINS)
         elif self.controller == 'lqr':
             self.gains = {'xy': lqr_gains(q_p, q_v, r), 'z': lqr_gains(*LQR_WEIGHTS['z'])}
-        else:
+        elif self.controller == 'lqr_lag':
             self.gains = {'xy': lqr_lag_gains(q_p, q_v, q_a, r, tau, 1.0 / RATE_HZ),
                           'z': lqr_gains(*LQR_WEIGHTS['z'])}
+        else:   # mpc for x and y, LQR for height
+            self.gains = {'xy': (mpc_q_p, mpc_q_v), 'z': lqr_gains(*LQR_WEIGHTS['z'])}
+            self.mpc = [AxisMPC(dt=0.05, horizon=30, tau=tau, q_p=mpc_q_p, q_v=mpc_q_v,
+                                r=1.0, r_du=mpc_r_du, u_max=A_MAX_XY) for _ in range(2)]
+            self.tau = tau
+            self.n_delay = round(delay * RATE_HZ)
+            self.sent = deque([(0.0, 0.0)] * self.n_delay, maxlen=max(self.n_delay, 1))
+            self.a_est = [0.0, 0.0]          # model-based acceleration estimate
+            self.u_last = [0.0, 0.0]
+            self.solve_ms = 0.0
 
         pub_qos = QoSProfile(reliability=ReliabilityPolicy.BEST_EFFORT,
                              durability=DurabilityPolicy.TRANSIENT_LOCAL,
@@ -303,6 +325,39 @@ class TrackingSquare(Node):
         a[2] = clamp(a[2], A_MAX_Z)
         return tuple(a)
 
+    def control_mpc(self, ts, p_ref, v_ref, a_ref):
+        """MPC for x and y (looks ahead along the reference), LQR for z."""
+        import time
+        t_start = time.perf_counter()
+        pending = list(self.sent) if self.n_delay else []
+        t_act = ts + self.n_delay / RATE_HZ      # when the next command starts to act
+        m = self.mpc[0]
+        future = [self.ref.at(t_act + j * m.dt) for j in range(m.N + 1)]
+        meas = ((self.pos.x, self.pos.vx), (self.pos.y, self.pos.vy))
+        u = [0.0, 0.0]
+        for k in range(2):
+            x0 = predict_through_delay([meas[k][0], meas[k][1], self.a_est[k]],
+                                       [c[k] for c in pending], 1.0 / RATE_HZ, self.tau)
+            p_f = [future[j + 1][0][k] for j in range(m.N)]
+            v_f = [future[j + 1][1][k] for j in range(m.N)]
+            a_f = [future[j][2][k] for j in range(m.N)]
+            u[k], _ = self.mpc[k].solve(x0, p_f, v_f, a_f, self.u_last[k])
+        a_xy = math.hypot(u[0], u[1])
+        if a_xy > A_MAX_XY:
+            u = [u[0] * A_MAX_XY / a_xy, u[1] * A_MAX_XY / a_xy]
+        # bookkeeping: the command that starts acting now updates the acceleration estimate
+        acting = self.sent[0] if self.n_delay else u
+        for k in range(2):
+            self.a_est[k] += (acting[k] - self.a_est[k]) / (RATE_HZ * self.tau)
+        if self.n_delay:
+            self.sent.append((u[0], u[1]))
+        self.u_last = u
+        kp, kd = self.gains['z']
+        az = clamp(a_ref[2] + kp * (p_ref[2] - self.pos.z) + kd * (v_ref[2] - self.pos.vz),
+                   A_MAX_Z)
+        self.solve_ms = max(self.solve_ms, (time.perf_counter() - t_start) * 1000)
+        return (u[0], u[1], az)
+
     # ---------------- main loop ----------------
     def step(self):
         self.tick += 1
@@ -364,12 +419,18 @@ class TrackingSquare(Node):
                     'PX4 estimator reset its position during the square -> this run is not valid')
                 self.last_reset = self.pos.xy_reset_counter
             ref_p, ref_v, ref_a = self.ref.at(ts)
-            acc = self.control(ref_p, ref_v, ref_a)
+            if self.controller == 'mpc':
+                acc = self.control_mpc(ts, ref_p, ref_v, ref_a)
+            else:
+                acc = self.control(ref_p, ref_v, ref_a)
             self.publish_mode(acceleration=True)
             self.publish_setpoint(acceleration=acc)
             if ts > self.ref.end_time:
                 verdict = 'VALID run' if self.jumps == 0 else f'NOT valid ({self.jumps} glitches)'
                 self.get_logger().info(f'Square complete ({verdict}). Landing.')
+                if self.controller == 'mpc':
+                    self.get_logger().info(f'Slowest MPC step: {self.solve_ms:.1f} ms '
+                                           f'(must stay well below {1000 / RATE_HZ:.0f} ms)')
                 self.send_command(VehicleCommand.VEHICLE_CMD_NAV_LAND)
                 self.state = 'LAND'
 
