@@ -241,6 +241,8 @@ class TrackingSquare(Node):
         self.reference = self.declare_parameter('reference', 'smooth').value
         self.trajectory = self.declare_parameter('trajectory', 'square').value
         self.laps = int(self.declare_parameter('laps', 2).value)
+        # simulated wind: acceleration disturbance [m/s^2] added to every controller's command
+        self.wind = float(self.declare_parameter('wind', 0.0).value)
         self.tag = self.declare_parameter('tag', '').value
         tag = self.tag
         q_p = float(self.declare_parameter('q_p', LQR_WEIGHTS['xy'][0]).value)
@@ -301,15 +303,17 @@ class TrackingSquare(Node):
         self.tick = 0
         self.done = False
         self.climb_t0 = 0.0
+        self.dist = (0.0, 0.0)
         self.t0 = self.now()
 
         log_path = os.path.expanduser(
-            f'~/{self.trajectory}_{self.controller}_{self.reference}{tag}.csv')
+            f'~/{self.trajectory}_{self.controller}_{self.reference}'
+            f'{"_wind" if self.wind else ""}{tag}.csv')
         self.log_file = open(log_path, 'w', newline='')
         self.log = csv.writer(self.log_file)
         self.log.writerow(['t', 'state', 'x', 'y', 'z', 'vx', 'vy', 'vz',
                            'ref_x', 'ref_y', 'ref_z', 'ax', 'ay', 'az',
-                           'xy_reset', 'z_reset', 'px4_t'])
+                           'xy_reset', 'z_reset', 'px4_t', 'wind_n', 'wind_e'])
 
         self.create_timer(1.0 / RATE_HZ, self.step)
         gains_xy = ' '.join(f'{k:.2f}' for k in self.gains['xy'])
@@ -422,6 +426,16 @@ class TrackingSquare(Node):
         self.solve_ms = max(self.solve_ms, (time.perf_counter() - t_start) * 1000)
         return (u[0], u[1], az)
 
+    def wind_disturbance(self, ts):
+        """Wind as an acceleration disturbance (north, east) [m/s^2].
+
+        Steady push to the east (wind) plus a gust that swings north/south at 0.5 Hz,
+        active from 3 s after the start until 3 s before the end of the reference.
+        """
+        if self.wind == 0.0 or ts < 3.0 or ts > self.ref.end_time - 3.0:
+            return 0.0, 0.0
+        return self.wind * math.sin(2 * math.pi * 0.5 * (ts - 3.0)), self.wind
+
     # ---------------- main loop ----------------
     def step(self):
         self.tick += 1
@@ -494,17 +508,21 @@ class TrackingSquare(Node):
                     'PX4 estimator reset its position during the square -> this run is not valid')
                 self.last_reset = self.pos.xy_reset_counter
             ref_p, ref_v, ref_a = self.ref.at(ts)
+            dn, de = self.wind_disturbance(ts)
+            self.dist = (dn, de)
             if self.controller == 'px4':
                 # baseline: PX4's own position controller follows the SAME reference,
-                # with velocity and acceleration as feed-forward
-                acc = ref_a
+                # with velocity and acceleration as feed-forward (the wind is added to the
+                # acceleration feed-forward, which PX4 adds to its controller output)
+                acc = (ref_a[0] + dn, ref_a[1] + de, ref_a[2])
                 self.publish_mode(acceleration=False)
-                self.publish_setpoint(position=ref_p, velocity=ref_v, acceleration=ref_a)
+                self.publish_setpoint(position=ref_p, velocity=ref_v, acceleration=acc)
             else:
                 if self.controller == 'mpc':
                     acc = self.control_mpc(ts, ref_p, ref_v, ref_a)
                 else:
                     acc = self.control(ref_p, ref_v, ref_a)
+                acc = (acc[0] + dn, acc[1] + de, acc[2])   # wind acts on top of the controller
                 self.publish_mode(acceleration=True)
                 self.publish_setpoint(acceleration=acc)
             if ts > self.ref.end_time:
@@ -528,7 +546,8 @@ class TrackingSquare(Node):
                            f'{ref_p[0]:.3f}', f'{ref_p[1]:.3f}', f'{ref_p[2]:.3f}',
                            f'{acc[0]:.3f}', f'{acc[1]:.3f}', f'{acc[2]:.3f}',
                            self.pos.xy_reset_counter, self.pos.z_reset_counter,
-                           f'{self.pos.timestamp * 1e-6:.4f}'])
+                           f'{self.pos.timestamp * 1e-6:.4f}',
+                           f'{self.dist[0]:.3f}', f'{self.dist[1]:.3f}'])
 
     def write_result(self, verdict):
         with open(os.path.expanduser('~/runs.txt'), 'a') as f:

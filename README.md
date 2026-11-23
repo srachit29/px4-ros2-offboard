@@ -71,6 +71,26 @@ same reference. Repeated valid runs agreed within about 1 cm.
   exact model, the same MPC reaches 2-4 cm, so model mismatch (tilt dynamics, drag) is the
   remaining limit.
 
+### Wind disturbance (figure-eight, one lap)
+
+Wind is modelled as an acceleration disturbance added to every controller's command (also to
+PX4's acceleration feed-forward): a steady 1 m/s^2 push to the east (about 1.5 N on the
+1.5 kg vehicle) plus a 1 m/s^2 north-south gust at 0.5 Hz, active from 3 s until 3 s before the end.
+
+![Wind](results/compare_wind.png)
+
+| Controller | Tracking error RMS (wind active) | Max error | East offset at end of wind |
+|---|---|---|---|
+| PX4 position control | **30.6 cm** | 63.0 cm | **8 cm** (shrinking) |
+| Own PD | 52.2 cm | 79.6 cm | 55 cm |
+| Own LQR | 44.8 cm | 69.2 cm | 48 cm |
+| Own MPC | 39.7 cm | **58.4 cm** | 43 cm |
+
+- PX4's cascaded controller has integral action and slowly removes the steady offset. The own
+  PD, LQR and MPC have none, so the steady wind pushes them off by 43-55 cm for as long as it blows.
+- Among the own controllers, MPC handles the gusts best (smallest maximum error of all).
+- Next step: integral action for PD/LQR and a disturbance estimate for offset-free MPC.
+
 ### Simulator timing issue
 
 On this setup (WSL2, Gazebo Harmonic), the simulation occasionally advances about 2.5 s
@@ -151,7 +171,8 @@ Never use these settings on a real vehicle.
 - [x] Model Predictive Control (MPC)
 - [ ] Reinforcement learning controller
 - [x] Figure-eight comparison (incl. fair PX4 baseline on the same reference)
-- [ ] Wind-disturbance test
+- [x] Wind-disturbance test
+- [ ] Integral action / offset-free MPC
 
 ## Related work
 
