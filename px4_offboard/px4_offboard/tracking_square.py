@@ -21,6 +21,11 @@ LQR weights can be changed without editing code:
                      and also gives the controller the planned acceleration
                      (feed-forward), so it does not have to wait for an error
 
+  trajectory:=square   5 x 5 m square (default)
+  trajectory:=figure8  figure-eight, 6 m long, 3 m wide, 12 s per lap, flown twice
+  controller:=px4      baseline: PX4's own position controller follows the same reference
+                       (position + velocity + acceleration feed-forward)
+
 Example:
   ros2 run px4_offboard tracking_square --ros-args -p controller:=lqr -p reference:=smooth
 
@@ -177,12 +182,67 @@ class SquareReference:
         return (point[0], point[1], ALT), zero, zero
 
 
+class FigureEightReference:
+    """Figure-eight (lemniscate of Gerono) at constant height, flown twice.
+
+    shape:  north = A sin(phi),  east = (A / 2) sin(2 phi)     (passes through home at phi = 0)
+    phase:  phi_dot = w * sigma(t), sigma ramps 0 -> 1 -> 0 with minimum-jerk profiles,
+            so the drone starts and stops smoothly at home.
+    Returns position, velocity AND acceleration (feed-forward), like the smooth square.
+    """
+
+    def __init__(self, home, size=3.0, period=12.0, laps=2, ramp=3.0):
+        self.home, self.A, self.w, self.Tr = home, size, 2 * math.pi / period, ramp
+        self.t_start = HOLD_TIME
+        self.T_cruise = laps * period - ramp          # each ramp adds ramp/2 of full-speed time
+        self.t_ramp_down = self.t_start + ramp + self.T_cruise
+        self.t_stop = self.t_ramp_down + ramp
+        self.end_time = self.t_stop + HOLD_TIME
+
+    def _phase(self, t):
+        """Return phi, phi_dot, phi_ddot at time t."""
+        w, Tr = self.w, self.Tr
+        if t <= self.t_start:
+            return 0.0, 0.0, 0.0
+        if t < self.t_start + Tr:                       # ramp up
+            tau = (t - self.t_start) / Tr
+            sig = 10 * tau ** 3 - 15 * tau ** 4 + 6 * tau ** 5
+            dsig = (30 * tau ** 2 - 60 * tau ** 3 + 30 * tau ** 4) / Tr
+            integral = Tr * (2.5 * tau ** 4 - 3 * tau ** 5 + tau ** 6)
+            return w * integral, w * sig, w * dsig
+        phi_up = w * Tr * 0.5
+        if t < self.t_ramp_down:                        # cruise
+            return phi_up + w * (t - self.t_start - Tr), w, 0.0
+        phi_cruise = phi_up + w * self.T_cruise
+        if t < self.t_stop:                             # ramp down (mirror of ramp up)
+            tau = (t - self.t_ramp_down) / Tr
+            sig = 1 - (10 * tau ** 3 - 15 * tau ** 4 + 6 * tau ** 5)
+            dsig = -(30 * tau ** 2 - 60 * tau ** 3 + 30 * tau ** 4) / Tr
+            integral = Tr * (tau - (2.5 * tau ** 4 - 3 * tau ** 5 + tau ** 6))
+            return phi_cruise + w * integral, w * sig, w * dsig
+        return phi_cruise + w * Tr * 0.5, 0.0, 0.0
+
+    def at(self, t):
+        phi, dphi, ddphi = self._phase(t)
+        A = self.A
+        f = (A * math.sin(phi), 0.5 * A * math.sin(2 * phi))
+        df = (A * math.cos(phi), A * math.cos(2 * phi))
+        ddf = (-A * math.sin(phi), -2 * A * math.sin(2 * phi))
+        p = (self.home[0] + f[0], self.home[1] + f[1], ALT)
+        v = (df[0] * dphi, df[1] * dphi, 0.0)
+        a = (ddf[0] * dphi ** 2 + df[0] * ddphi, ddf[1] * dphi ** 2 + df[1] * ddphi, 0.0)
+        return p, v, a
+
+
 class TrackingSquare(Node):
     def __init__(self):
         super().__init__('tracking_square')
         self.controller = self.declare_parameter('controller', 'lqr').value
         self.reference = self.declare_parameter('reference', 'smooth').value
-        tag = self.declare_parameter('tag', '').value
+        self.trajectory = self.declare_parameter('trajectory', 'square').value
+        self.laps = int(self.declare_parameter('laps', 2).value)
+        self.tag = self.declare_parameter('tag', '').value
+        tag = self.tag
         q_p = float(self.declare_parameter('q_p', LQR_WEIGHTS['xy'][0]).value)
         q_v = float(self.declare_parameter('q_v', LQR_WEIGHTS['xy'][1]).value)
         q_a = float(self.declare_parameter('q_a', 0.1).value)
@@ -192,13 +252,15 @@ class TrackingSquare(Node):
         mpc_q_p = float(self.declare_parameter('mpc_q_p', 50.0).value)
         mpc_q_v = float(self.declare_parameter('mpc_q_v', 5.0).value)
         mpc_r_du = float(self.declare_parameter('mpc_r_du', 2.0).value)
-        if self.controller not in ('pd', 'lqr', 'lqr_lag', 'mpc') or \
+        if self.trajectory not in ('square', 'figure8'):
+            raise ValueError('trajectory must be square|figure8')
+        if self.controller not in ('px4', 'pd', 'lqr', 'lqr_lag', 'mpc') or \
                 self.reference not in ('linear', 'smooth'):
-            raise ValueError('controller must be pd|lqr|lqr_lag|mpc, '
+            raise ValueError('controller must be px4|pd|lqr|lqr_lag|mpc, '
                              'reference must be linear|smooth')
 
         # xy gains are (K_p, K_v) or (K_p, K_v, K_a); z always uses a 2-state LQR/PD
-        if self.controller == 'pd':
+        if self.controller in ('pd', 'px4'):            # px4: gains unused (PX4 controls)
             self.gains = dict(PD_GAINS)
         elif self.controller == 'lqr':
             self.gains = {'xy': lqr_gains(q_p, q_v, r), 'z': lqr_gains(*LQR_WEIGHTS['z'])}
@@ -238,14 +300,16 @@ class TrackingSquare(Node):
         self.state = 'INIT'
         self.tick = 0
         self.done = False
+        self.climb_t0 = 0.0
         self.t0 = self.now()
 
-        log_path = os.path.expanduser(f'~/square_{self.controller}_{self.reference}{tag}.csv')
+        log_path = os.path.expanduser(
+            f'~/{self.trajectory}_{self.controller}_{self.reference}{tag}.csv')
         self.log_file = open(log_path, 'w', newline='')
         self.log = csv.writer(self.log_file)
         self.log.writerow(['t', 'state', 'x', 'y', 'z', 'vx', 'vy', 'vz',
                            'ref_x', 'ref_y', 'ref_z', 'ax', 'ay', 'az',
-                           'xy_reset', 'z_reset'])
+                           'xy_reset', 'z_reset', 'px4_t'])
 
         self.create_timer(1.0 / RATE_HZ, self.step)
         gains_xy = ' '.join(f'{k:.2f}' for k in self.gains['xy'])
@@ -298,10 +362,10 @@ class TrackingSquare(Node):
         msg.timestamp = self.stamp_us()
         self.offboard_pub.publish(msg)
 
-    def publish_setpoint(self, position=None, acceleration=None):
+    def publish_setpoint(self, position=None, acceleration=None, velocity=None):
         msg = TrajectorySetpoint()
         msg.position = [float(v) for v in position] if position else [NAN] * 3
-        msg.velocity = [NAN] * 3
+        msg.velocity = [float(v) for v in velocity] if velocity else [NAN] * 3
         msg.acceleration = [float(v) for v in acceleration] if acceleration else [NAN] * 3
         msg.yaw = 0.0
         msg.timestamp = self.stamp_us()
@@ -386,17 +450,26 @@ class TrackingSquare(Node):
                     self.send_command(VehicleCommand.VEHICLE_CMD_COMPONENT_ARM_DISARM, 1.0)
                 if self.is_offboard() and self.is_armed():
                     self.get_logger().info('Armed. PX4 climbs to start point...')
+                    self.climb_t0 = t
                     self.state = 'CLIMB'
 
+            if self.state == 'CLIMB' and t - self.climb_t0 > 30.0:
+                self.get_logger().warn('Did not reach start point within 30 s. Landing.')
+                self.write_result('NOT valid (no start)')
+                self.send_command(VehicleCommand.VEHICLE_CMD_NAV_LAND)
+                self.state = 'LAND'
             if self.state == 'CLIMB':
                 dist = math.dist((self.pos.x, self.pos.y, self.pos.z), ref_p)
                 if dist < 0.2 and math.hypot(self.pos.vx, self.pos.vy) < 0.2:
-                    self.ref = SquareReference(self.home, self.reference == 'smooth')
+                    if self.trajectory == 'figure8':
+                        self.ref = FigureEightReference(self.home, laps=self.laps)
+                    else:
+                        self.ref = SquareReference(self.home, self.reference == 'smooth')
                     self.square_t0 = t
                     self.last_reset = self.pos.xy_reset_counter
                     self.state = 'SQUARE'
                     self.get_logger().info(
-                        f'At start. Switching to YOUR {self.controller.upper()} controller.')
+                        f'At start. Flying {self.trajectory} with {self.controller.upper()}.')
 
         elif self.state == 'SQUARE':
             if not self.is_offboard():
@@ -404,30 +477,40 @@ class TrackingSquare(Node):
                 self.done = True
                 return
             ts = t - self.square_t0
+            px4_t = self.pos.timestamp * 1e-6          # PX4 (simulation) time [s]
             if self.prev is not None:            # position must match velocity * time
-                pt, px, py, pvx, pvy = self.prev
+                pt, px, py, pvx, pvy, ppx4 = self.prev
                 dt = t - pt
                 jump = math.hypot(self.pos.x - (px + pvx * dt), self.pos.y - (py + pvy * dt))
                 if jump > 0.1:
                     self.jumps += 1
                     self.get_logger().warn(
-                        f'Position jumped {jump:.2f} m at {ts:.1f} s (estimator glitch) '
-                        '-> this run is not valid, please fly again')
-            self.prev = (t, self.pos.x, self.pos.y, self.pos.vx, self.pos.vy)
+                        f'Position jumped {jump:.2f} m at {ts:.1f} s. Node time advanced '
+                        f'{dt * 1000:.0f} ms, PX4 simulation time advanced '
+                        f'{(px4_t - ppx4) * 1000:.0f} ms -> this run is not valid')
+            self.prev = (t, self.pos.x, self.pos.y, self.pos.vx, self.pos.vy, px4_t)
             if self.pos.xy_reset_counter != self.last_reset:
                 self.get_logger().warn(
                     'PX4 estimator reset its position during the square -> this run is not valid')
                 self.last_reset = self.pos.xy_reset_counter
             ref_p, ref_v, ref_a = self.ref.at(ts)
-            if self.controller == 'mpc':
-                acc = self.control_mpc(ts, ref_p, ref_v, ref_a)
+            if self.controller == 'px4':
+                # baseline: PX4's own position controller follows the SAME reference,
+                # with velocity and acceleration as feed-forward
+                acc = ref_a
+                self.publish_mode(acceleration=False)
+                self.publish_setpoint(position=ref_p, velocity=ref_v, acceleration=ref_a)
             else:
-                acc = self.control(ref_p, ref_v, ref_a)
-            self.publish_mode(acceleration=True)
-            self.publish_setpoint(acceleration=acc)
+                if self.controller == 'mpc':
+                    acc = self.control_mpc(ts, ref_p, ref_v, ref_a)
+                else:
+                    acc = self.control(ref_p, ref_v, ref_a)
+                self.publish_mode(acceleration=True)
+                self.publish_setpoint(acceleration=acc)
             if ts > self.ref.end_time:
                 verdict = 'VALID run' if self.jumps == 0 else f'NOT valid ({self.jumps} glitches)'
-                self.get_logger().info(f'Square complete ({verdict}). Landing.')
+                self.write_result(verdict)
+                self.get_logger().info(f'{self.trajectory} complete ({verdict}). Landing.')
                 if self.controller == 'mpc':
                     self.get_logger().info(f'Slowest MPC step: {self.solve_ms:.1f} ms '
                                            f'(must stay well below {1000 / RATE_HZ:.0f} ms)')
@@ -444,7 +527,12 @@ class TrackingSquare(Node):
                            f'{self.pos.vx:.3f}', f'{self.pos.vy:.3f}', f'{self.pos.vz:.3f}',
                            f'{ref_p[0]:.3f}', f'{ref_p[1]:.3f}', f'{ref_p[2]:.3f}',
                            f'{acc[0]:.3f}', f'{acc[1]:.3f}', f'{acc[2]:.3f}',
-                           self.pos.xy_reset_counter, self.pos.z_reset_counter])
+                           self.pos.xy_reset_counter, self.pos.z_reset_counter,
+                           f'{self.pos.timestamp * 1e-6:.4f}'])
+
+    def write_result(self, verdict):
+        with open(os.path.expanduser('~/runs.txt'), 'a') as f:
+            f.write(f'{self.trajectory} {self.controller}{self.tag}: {verdict}\n')
 
     def close(self):
         self.log_file.close()

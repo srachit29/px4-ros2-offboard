@@ -47,6 +47,38 @@ Own controllers send acceleration setpoints; PX4 only handles attitude and motor
 20 ms step). `tracking_square.py` checks that position matches velocity x time and marks
 such runs as not valid. Apart from the marked PD run (kept to show the overshoot), only valid runs are in the table.
 
+
+### Figure-eight (6 x 3 m, up to 2.2 m/s, one lap)
+
+All four controllers follow the same minimum-jerk figure-eight with feed-forward; the PX4
+baseline (`controller:=px4`) receives position, velocity and acceleration setpoints of the
+same reference. Repeated valid runs agreed within about 1 cm.
+
+![Figure-eight](results/compare_figure8.png)
+
+| Controller | Tracking error RMS | Tracking error max | Path error RMS | Height error RMS |
+|---|---|---|---|---|
+| PX4 position control | **11.6 cm** | **20.5 cm** | **7.2 cm** | 4.5 cm |
+| Own PD | 13.7 cm | 27.4 cm | 10.5 cm | 3.2 cm |
+| Own LQR | 12.0 cm | 26.4 cm | 8.6 cm | 3.1 cm |
+| Own MPC (delay 0) | 12.5 cm | 21.4 cm | 10.2 cm | 3.1 cm |
+
+- On continuous curves, PX4's tuned cascaded controller tracks best in the horizontal plane;
+  the own controllers hold height better (3 cm vs. 4.5 cm).
+- MPC is sensitive to its model: with the 0.08 s input delay identified on the square, it
+  reached 15.4 cm; the figure-eight logs show a shorter delay (0-0.04 s), and with delay 0 it
+  improved to 12.5 cm with the smallest maximum error of the own controllers. Offline, with an
+  exact model, the same MPC reaches 2-4 cm, so model mismatch (tilt dynamics, drag) is the
+  remaining limit.
+
+### Simulator timing issue
+
+On this setup (WSL2, Gazebo Harmonic), the simulation occasionally advances about 2.5 s
+while the ROS 2 node advances only 20 ms, so the vehicle flies on its last command. The node
+logs PX4's simulation time next to its own clock and marks such runs as not valid; disabling
+PX4's time sync (`UXRCE_DDS_SYNCT 0`) did not remove it. Each controller was therefore flown
+several times and only valid runs are reported.
+
 ## How it works
 
 ```
@@ -118,7 +150,8 @@ Never use these settings on a real vehicle.
 - [x] Minimum-jerk reference with feed-forward, lag identification from flight logs
 - [x] Model Predictive Control (MPC)
 - [ ] Reinforcement learning controller
-- [ ] Comparison on square, figure-eight and wind-disturbance tests
+- [x] Figure-eight comparison (incl. fair PX4 baseline on the same reference)
+- [ ] Wind-disturbance test
 
 ## Related work
 
