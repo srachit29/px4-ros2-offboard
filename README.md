@@ -89,7 +89,30 @@ PX4's acceleration feed-forward): a steady 1 m/s^2 push to the east (about 1.5 N
 - PX4's cascaded controller has integral action and slowly removes the steady offset. The own
   PD, LQR and MPC have none, so the steady wind pushes them off by 43-55 cm for as long as it blows.
 - Among the own controllers, MPC handles the gusts best (smallest maximum error of all).
-- Next step: integral action for PD/LQR and a disturbance estimate for offset-free MPC.
+- The MPC run contains one small (0.2 m) estimator jump at 1.9 s, before the wind starts;
+  the wind-window metrics are not affected.
+
+#### With integral action / offset-free MPC (`-p integral:=true`)
+
+- PD becomes PID (integral of the position error, anti-windup).
+- LQR becomes LQI: LQR on [integral of error, error, error rate].
+- MPC becomes offset-free: a disturbance observer compares the measured velocity change with
+  the acceleration the model expected, low-pass filters the difference (0.5 s) and the MPC
+  compensates it.
+
+![Wind with integral action](results/compare_wind_integral.png)
+
+| Controller | Tracking error RMS (wind active) | Max error | East offset at end of wind | Valid runs |
+|---|---|---|---|---|
+| PX4 position control | 30.6 cm | 63 cm | 8 cm | 2 |
+| Own MPC, offset-free | 30.5 cm (25-33) | 58 cm (47-65) | 5-9 cm | 3 |
+| Own PID | 31.5 cm | **57.5 cm** | 9 cm | 1 |
+| Own LQI | 34.3 cm (33-35) | 71-73 cm | 4-5 cm | 3 |
+
+- Integral action removes the steady offset (43-55 cm -> 4-9 cm) and brings the own
+  controllers level with PX4 in wind (30-34 cm vs. 30.6 cm), from 30-70 % worse before.
+- Run-to-run spread is larger in wind (MPC 25-33 cm), so the remaining differences between
+  PX4, offset-free MPC and PID are within that spread.
 
 ### Simulator timing issue
 
@@ -172,7 +195,7 @@ Never use these settings on a real vehicle.
 - [ ] Reinforcement learning controller
 - [x] Figure-eight comparison (incl. fair PX4 baseline on the same reference)
 - [x] Wind-disturbance test
-- [ ] Integral action / offset-free MPC
+- [x] Integral action / offset-free MPC
 
 ## Related work
 

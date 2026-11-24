@@ -13,6 +13,12 @@ Two choices, set as ROS parameters:
                        follows an acceleration command (time constant tau),
                        and feeds back the measured acceleration as well
 
+Integral action / disturbance rejection (-p integral:=true):
+  pd   -> PID: adds Ki * integral of the position error (Ki = 1.0, anti-windup limit)
+  lqr  -> LQR on [integral of error, position error, velocity error] (weight q_i = 4)
+  mpc  -> offset-free MPC: a disturbance observer estimates the unmodelled acceleration
+          (wind, model mismatch) from the measured velocity and the MPC compensates it
+
 LQR weights can be changed without editing code:
   -p q_p:=9.0 -p q_v:=4.0 -p q_a:=0.1 -p r:=1.0 -p tau:=0.2
 
@@ -106,6 +112,20 @@ def dlqr(A, B, Q, R, iters=10000):
             break
         P = P_next
     return K
+
+
+def lqr_integral_gains(q_i, q_p, q_v, r, dt):
+    """Gains [K_i, K_p, K_v] for x = [integral of e, e, e_dot], e_ddot = u."""
+    import numpy as np
+    A_c = np.array([[0.0, 1.0, 0.0], [0.0, 0.0, 1.0], [0.0, 0.0, 0.0]])
+    B_c = np.array([[0.0], [0.0], [1.0]])
+    K = dlqr(np.eye(3) + A_c * dt, B_c * dt, np.diag([q_i, q_p, q_v]), np.array([[r]]))
+    return tuple(float(k) for k in K[0])
+
+
+KI_PD = 1.0          # integral gain for the PID variant
+I_LIMIT = 2.0        # anti-windup: max integral contribution [m/s^2]
+D_TAU = 0.5          # disturbance observer time constant [s]
 
 
 def lqr_lag_gains(q_p, q_v, q_a, r, tau, dt):
@@ -243,6 +263,7 @@ class TrackingSquare(Node):
         self.laps = int(self.declare_parameter('laps', 2).value)
         # simulated wind: acceleration disturbance [m/s^2] added to every controller's command
         self.wind = float(self.declare_parameter('wind', 0.0).value)
+        self.integral = bool(self.declare_parameter('integral', False).value)
         self.tag = self.declare_parameter('tag', '').value
         tag = self.tag
         q_p = float(self.declare_parameter('q_p', LQR_WEIGHTS['xy'][0]).value)
@@ -279,6 +300,16 @@ class TrackingSquare(Node):
             self.a_est = [0.0, 0.0]          # model-based acceleration estimate
             self.u_last = [0.0, 0.0]
             self.solve_ms = 0.0
+            self.d_hat = [0.0, 0.0]          # disturbance estimate (offset-free MPC)
+            self.v_prev = None
+        # integral action for PD (PID) and LQR (LQI)
+        self.ki_xy = 0.0
+        if self.integral and self.controller == 'pd':
+            self.ki_xy = KI_PD
+        elif self.integral and self.controller == 'lqr':
+            ki, kp, kv = lqr_integral_gains(4.0, q_p, q_v, r, 1.0 / RATE_HZ)
+            self.ki_xy, self.gains['xy'] = ki, (kp, kv)
+        self.e_int = [0.0, 0.0]
 
         pub_qos = QoSProfile(reliability=ReliabilityPolicy.BEST_EFFORT,
                              durability=DurabilityPolicy.TRANSIENT_LOCAL,
@@ -308,7 +339,7 @@ class TrackingSquare(Node):
 
         log_path = os.path.expanduser(
             f'~/{self.trajectory}_{self.controller}_{self.reference}'
-            f'{"_wind" if self.wind else ""}{tag}.csv')
+            f'{"_wind" if self.wind else ""}{"_int" if self.integral else ""}{tag}.csv')
         self.log_file = open(log_path, 'w', newline='')
         self.log = csv.writer(self.log_file)
         self.log.writerow(['t', 'state', 'x', 'y', 'z', 'vx', 'vy', 'vz',
@@ -386,6 +417,10 @@ class TrackingSquare(Node):
             u = a_ref[i] + k[0] * (p_ref[i] - p[i]) + k[1] * (v_ref[i] - v[i])
             if len(k) == 3:                       # lqr_lag: also use the acceleration error
                 u += k[2] * (a_ref[i] - a_meas[i])
+            if i < 2 and self.ki_xy > 0.0:        # integral action (horizontal)
+                self.e_int[i] += (p_ref[i] - p[i]) / RATE_HZ
+                self.e_int[i] = clamp(self.e_int[i], I_LIMIT / self.ki_xy)   # anti-windup
+                u += self.ki_xy * self.e_int[i]
             a.append(u)
         a_xy = math.hypot(a[0], a[1])
         if a_xy > A_MAX_XY:
@@ -402,6 +437,16 @@ class TrackingSquare(Node):
         m = self.mpc[0]
         future = [self.ref.at(t_act + j * m.dt) for j in range(m.N + 1)]
         meas = ((self.pos.x, self.pos.vx), (self.pos.y, self.pos.vy))
+        if self.integral:
+            # disturbance observer: measured velocity change minus the acceleration the model
+            # expected = unmodelled acceleration (wind, model error); low-pass filtered
+            v_now = (self.pos.vx, self.pos.vy)
+            if self.v_prev is not None:
+                for k in range(2):
+                    resid = (v_now[k] - self.v_prev[k]) * RATE_HZ - self.a_est[k]
+                    self.d_hat[k] += resid / (RATE_HZ * D_TAU)
+                    self.d_hat[k] = clamp(self.d_hat[k], I_LIMIT)
+            self.v_prev = v_now
         u = [0.0, 0.0]
         for k in range(2):
             x0 = predict_through_delay([meas[k][0], meas[k][1], self.a_est[k]],
@@ -420,6 +465,9 @@ class TrackingSquare(Node):
         if self.n_delay:
             self.sent.append((u[0], u[1]))
         self.u_last = u
+        if self.integral:
+            # MPC plans the NET acceleration; send command = net - estimated disturbance
+            u = [u[0] - self.d_hat[0], u[1] - self.d_hat[1]]
         kp, kd = self.gains['z']
         az = clamp(a_ref[2] + kp * (p_ref[2] - self.pos.z) + kd * (v_ref[2] - self.pos.vz),
                    A_MAX_Z)
