@@ -113,6 +113,39 @@ PX4's acceleration feed-forward): a steady 1 m/s^2 push to the east (about 1.5 N
   controllers level with PX4 in wind (30-34 cm vs. 30.6 cm), from 30-70 % worse before.
 - Run-to-run spread is larger in wind (MPC 25-33 cm), so the remaining differences between
   PX4, offset-free MPC and PID are within that spread.
+- The offset-free MPC oscillates at about 1 Hz during the wind (spiky error in the plot): the
+  observer, the gusts and the vehicle lag interact. A slower observer or including the
+  disturbance as a state inside the MPC model are the obvious next refinements.
+
+## Reinforcement learning (PPO)
+
+A neural-network controller (2 x 64 tanh MLP, 16 inputs, 2 outputs) was trained with PPO
+(Stable-Baselines3) in a fast numpy simulator of the horizontal dynamics (`rl/quad_env.py`),
+built from the lag model identified from the PX4 logs. Domain randomisation per episode: lag
+0.15-0.30 s, delay 0-0.06 s, random references (figure-eight, circle, smooth random curves,
+hover) and random wind. 2 M steps took about 9 minutes on a laptop CPU. The trained actor is
+exported to `rl/policy.npz` and run in the ROS 2 node with plain numpy (`controller:=rl`);
+it never saw Gazebo during training.
+
+| Test | RL (PPO) | Best classical | PX4 |
+|---|---|---|---|
+| Training simulator, 50 random episodes | **6.0 cm** | LQI 7.4 cm | - |
+| Gazebo figure-eight, no wind (tracking RMS) | 17.0 cm | LQR 12.0 cm | 11.6 cm |
+| Gazebo figure-eight, wind (tracking RMS) | **25.1 cm** | MPC offset-free 30.5 cm | 30.6 cm |
+| Gazebo figure-eight, wind (max error) | **46.9 cm** | PID 57.5 cm | 63.0 cm |
+
+![RL figure-eight](results/compare_figure8_rl.png)
+![RL wind](results/compare_wind_rl.png)
+
+- In wind, the policy tracked best of all controllers, including PX4: it learned to react to
+  gusts from 3.75 million randomised wind situations. It keeps a larger steady offset (20 cm)
+  than the integral controllers (5-9 cm).
+- Without wind it was the worst (17 cm, spikes up to 42 cm, 5 cm height offset): the
+  sim-to-real gap. The training simulator has no tilt dynamics, drag or vertical coupling,
+  and the policy was never trained on hover-to-figure-eight transitions like the classical
+  controllers were tuned on.
+- Only one valid run per case so far (the simulator glitch hit the others); results need
+  repeating before strong conclusions.
 
 ### Simulator timing issue
 
@@ -192,7 +225,7 @@ Never use these settings on a real vehicle.
 - [x] Custom position controller (PD, then LQR) sending acceleration setpoints
 - [x] Minimum-jerk reference with feed-forward, lag identification from flight logs
 - [x] Model Predictive Control (MPC)
-- [ ] Reinforcement learning controller
+- [x] Reinforcement learning controller (PPO, sim-to-sim transfer)
 - [x] Figure-eight comparison (incl. fair PX4 baseline on the same reference)
 - [x] Wind-disturbance test
 - [x] Integral action / offset-free MPC

@@ -9,6 +9,8 @@ Two choices, set as ROS parameters:
   controller:=mpc      Model Predictive Control (mpc.py): plans 1.5 s ahead with a
                        model that includes the drone's lag and delay, and uses the
                        FUTURE reference (it sees corners coming)
+  controller:=rl       neural-network policy trained with PPO in rl/ (rl/train.py),
+                       loaded from -p policy:=<path to policy.npz>
   controller:=lqr_lag  LQR on a model that also includes how slowly the drone
                        follows an acceleration command (time constant tau),
                        and feeds back the measured acceleration as well
@@ -63,6 +65,7 @@ from rclpy.qos import DurabilityPolicy, HistoryPolicy, QoSProfile, ReliabilityPo
 from collections import deque
 
 from px4_offboard.mpc import AxisMPC, predict_through_delay
+from px4_offboard import rl_common
 
 from px4_msgs.msg import (
     OffboardControlMode,
@@ -277,13 +280,19 @@ class TrackingSquare(Node):
         mpc_r_du = float(self.declare_parameter('mpc_r_du', 2.0).value)
         if self.trajectory not in ('square', 'figure8'):
             raise ValueError('trajectory must be square|figure8')
-        if self.controller not in ('px4', 'pd', 'lqr', 'lqr_lag', 'mpc') or \
+        policy_path = os.path.expanduser(self.declare_parameter(
+            'policy', '~/px4-ros2-offboard/rl/policy.npz').value)
+        if self.controller not in ('px4', 'pd', 'lqr', 'lqr_lag', 'mpc', 'rl') or \
                 self.reference not in ('linear', 'smooth'):
-            raise ValueError('controller must be px4|pd|lqr|lqr_lag|mpc, '
+            raise ValueError('controller must be px4|pd|lqr|lqr_lag|mpc|rl, '
                              'reference must be linear|smooth')
 
         # xy gains are (K_p, K_v) or (K_p, K_v, K_a); z always uses a 2-state LQR/PD
-        if self.controller in ('pd', 'px4'):            # px4: gains unused (PX4 controls)
+        if self.controller == 'rl':
+            self.policy = rl_common.MLPPolicy(policy_path)
+            self.rl_int = [0.0, 0.0]
+            self.rl_u_last = [0.0, 0.0]
+        if self.controller in ('pd', 'px4', 'rl'):     # px4/rl: xy gains unused
             self.gains = dict(PD_GAINS)
         elif self.controller == 'lqr':
             self.gains = {'xy': lqr_gains(q_p, q_v, r), 'z': lqr_gains(*LQR_WEIGHTS['z'])}
@@ -428,6 +437,22 @@ class TrackingSquare(Node):
         a[2] = clamp(a[2], A_MAX_Z)
         return tuple(a)
 
+    def control_rl(self, ts, p_ref, v_ref, a_ref):
+        """Trained policy for x and y (same observation as in training), LQR for z."""
+        p = (self.pos.x, self.pos.y)
+        v = (self.pos.vx, self.pos.vy)
+        self.rl_int = rl_common.update_integral(self.rl_int, p, p_ref)
+        obs = rl_common.build_obs(p, v, self.ref.at, ts, self.rl_int, self.rl_u_last)
+        u = self.policy.act(obs)
+        n = math.hypot(u[0], u[1])
+        if n > A_MAX_XY:
+            u = u * A_MAX_XY / n
+        self.rl_u_last = [float(u[0]), float(u[1])]
+        kp, kd = self.gains['z']
+        az = clamp(a_ref[2] + kp * (p_ref[2] - self.pos.z) + kd * (v_ref[2] - self.pos.vz),
+                   A_MAX_Z)
+        return (float(u[0]), float(u[1]), az)
+
     def control_mpc(self, ts, p_ref, v_ref, a_ref):
         """MPC for x and y (looks ahead along the reference), LQR for z."""
         import time
@@ -568,6 +593,8 @@ class TrackingSquare(Node):
             else:
                 if self.controller == 'mpc':
                     acc = self.control_mpc(ts, ref_p, ref_v, ref_a)
+                elif self.controller == 'rl':
+                    acc = self.control_rl(ts, ref_p, ref_v, ref_a)
                 else:
                     acc = self.control(ref_p, ref_v, ref_a)
                 acc = (acc[0] + dn, acc[1] + de, acc[2])   # wind acts on top of the controller
